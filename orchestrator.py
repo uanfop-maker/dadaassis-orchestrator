@@ -198,37 +198,53 @@ def call_gemini(
     timeout: int = 120,
     trace_id: str | None = None,
 ) -> tuple[str, dict | None]:
-    """呼叫 Gemini 2.5 Pro（直連 Google API），回傳 (text, usage_dict)。"""
-    if not GEMINI_API_KEY:
-        return "（Gemini 不可用，未設定 GEMINI_API_KEY）", None
+    """呼叫 Gemini 2.5 Pro：優先直連 Google API，429/5xx 時 fallback OpenRouter。"""
+    # 1. 直連 Google API
+    if GEMINI_API_KEY:
+        contents = []
+        if system:
+            contents.append({"role": "user", "parts": [{"text": system}]})
+            contents.append({"role": "model", "parts": [{"text": "已理解。"}]})
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            resp = requests.post(url, json={"contents": contents, "generationConfig": {"maxOutputTokens": 8192}}, timeout=timeout)
+            if resp.status_code not in (429, 500, 502, 503):
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                meta = data.get("usageMetadata", {})
+                usage = {"input_tokens": meta.get("promptTokenCount", 0), "output_tokens": meta.get("candidatesTokenCount", 0), "model": GEMINI_MODEL}
+                print(f"[ORCH] Gemini/direct done trace={trace_id} in={usage['input_tokens']} out={usage['output_tokens']}", flush=True)
+                return text, usage
+            print(f"[ORCH] Gemini/direct rate-limited ({resp.status_code}), falling back to OpenRouter trace={trace_id}", flush=True)
+        except Exception as exc:
+            print(f"[ORCH] Gemini/direct err trace={trace_id} err={exc}, trying OpenRouter", flush=True)
 
-    contents = []
-    if system:
-        contents.append({"role": "user", "parts": [{"text": system}]})
-        contents.append({"role": "model", "parts": [{"text": "已理解，我會按照指示回覆。"}]})
-    contents.append({"role": "user", "parts": [{"text": prompt}]})
+    # 2. Fallback: OpenRouter Gemini
+    if OPENROUTER_API_KEY:
+        or_model = f"google/{GEMINI_MODEL}" if not GEMINI_MODEL.startswith("google/") else GEMINI_MODEL
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            resp = requests.post(OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://dadaassis.zeabur.app", "X-Title": "DaDaAssis Gemini"},
+                json={"model": or_model, "messages": messages, "max_tokens": 8192},
+                timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"]
+            usage_raw = data.get("usage", {})
+            usage = {"input_tokens": usage_raw.get("prompt_tokens", 0), "output_tokens": usage_raw.get("completion_tokens", 0), "model": or_model}
+            print(f"[ORCH] Gemini/openrouter done trace={trace_id} in={usage['input_tokens']} out={usage['output_tokens']}", flush=True)
+            return text, usage
+        except Exception as exc:
+            print(f"[ORCH] Gemini/openrouter err trace={trace_id} err={exc}", flush=True)
+            return f"（Gemini 不可用：{exc}）", None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload = {
-        "contents": contents,
-        "generationConfig": {"maxOutputTokens": 8192},
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        meta = data.get("usageMetadata", {})
-        usage = {
-            "input_tokens": meta.get("promptTokenCount", 0),
-            "output_tokens": meta.get("candidatesTokenCount", 0),
-            "model": GEMINI_MODEL,
-        }
-        print(f"[ORCH] Gemini done trace={trace_id} in={usage['input_tokens']} out={usage['output_tokens']}", flush=True)
-        return text, usage
-    except Exception as exc:
-        print(f"[ORCH] Gemini call failed trace={trace_id} err={exc}", flush=True)
-        return f"（Gemini 呼叫失敗：{exc}）", None
+    return "（Gemini 不可用：未設定任何 API Key）", None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
