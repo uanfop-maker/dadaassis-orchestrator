@@ -17,7 +17,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 FABLE_MODEL = os.getenv("FABLE_MODEL", "anthropic/claude-fable-5")
 SONNET_MODEL = os.getenv("SONNET_MODEL", "anthropic/claude-sonnet-4-6")
-OPUS_ENDPOINT = os.getenv("CC_OPUS_ENDPOINT", "http://cc-opus.zeabur.internal:8080")
+OPUS_ENDPOINT = os.getenv("CC_OPUS_ENDPOINT", "http://cc-opus:8080")
 INTER_SERVICE_SECRET_OUT = os.getenv("INTER_SERVICE_SECRET_A", "")  # cc-v2 → cc-opus
 
 # 觸發 cc-opus 的關鍵詞
@@ -187,9 +187,9 @@ def dispatch_to_opus(
     callback_url 預設為 cc-v2 內網。
     """
     if not callback_url:
-        cc_v2_host = os.getenv("CC_V2_INTERNAL_HOST", "cc-v2.zeabur.internal")
-        cc_v2_port = os.getenv("CC_V2_INTERNAL_PORT", "8080")
-        callback_url = f"http://{cc_v2_host}:{cc_v2_port}/callback"
+        self_host = os.getenv("SELF_HOST", "cc-orchestrator")
+        self_port = os.getenv("SELF_PORT", "8080")
+        callback_url = f"http://{self_host}:{self_port}/callback"
 
     payload = {
         "job_id": job["job_id"],
