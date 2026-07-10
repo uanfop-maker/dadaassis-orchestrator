@@ -19,6 +19,9 @@ FABLE_MODEL = os.getenv("FABLE_MODEL", "anthropic/claude-fable-5")
 SONNET_MODEL = os.getenv("SONNET_MODEL", "anthropic/claude-sonnet-4-6")
 OPUS_ENDPOINT = os.getenv("CC_OPUS_ENDPOINT", "http://cc-opus:8080")
 INTER_SERVICE_SECRET_OUT = os.getenv("INTER_SERVICE_SECRET_A", "")  # cc-v2 → cc-opus
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # 觸發 cc-opus 的關鍵詞
 OPUS_KEYWORDS = [
@@ -30,6 +33,10 @@ FABLE_KEYWORDS = [
     "寫一篇", "寫一個", "創意", "故事", "詩", "文案", "仿寫",
     "寫作", "描述", "生成文章", "幫我寫", "write a", "create a story",
     "compose", "poem", "creative",
+]
+GEMINI_KEYWORDS = [
+    "診斷", "分析程式碼", "code review", "看一下這段", "parse", "解析",
+    "文件解讀", "api doc", "大量資料", "長文本",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -95,12 +102,17 @@ def circuit_allow() -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _classify(text: str, explicit_cmd: str | None = None) -> str:
-    """回傳 'opus' | 'fable' | 'local'。"""
+    """回傳 'opus' | 'fable' | 'gemini' | 'local'。"""
     if explicit_cmd in ("/deep", "/research"):
         return "opus"
     if explicit_cmd in ("/write", "/story", "/poem"):
         return "fable"
+    if explicit_cmd in ("/diagnose", "/gemini"):
+        return "gemini"
     lower = text.lower()
+    for kw in GEMINI_KEYWORDS:
+        if kw.lower() in lower:
+            return "gemini"
     for kw in OPUS_KEYWORDS:
         if kw.lower() in lower:
             return "opus"
@@ -109,7 +121,7 @@ def _classify(text: str, explicit_cmd: str | None = None) -> str:
             return "fable"
     # 長文本暗示需要深度推理
     if len(text) > 800:
-        return "opus"
+        return "gemini" if GEMINI_API_KEY else "opus"
     return "local"
 
 
@@ -121,7 +133,9 @@ def route(
     """決定任務路由，若 cc-opus 熔斷則降級 local。"""
     target = _classify(text, explicit_cmd)
     if target == "opus" and not circuit_allow():
-        return "local"
+        return "gemini" if GEMINI_API_KEY else "local"
+    if target == "gemini" and not GEMINI_API_KEY:
+        return "opus" if circuit_allow() else "local"
     return target
 
 
@@ -172,6 +186,49 @@ def call_fable(
 
 def _fable_fallback(prompt: str) -> str:
     return f"（Fable 模型暫不可用，已改用一般模式）\n\n{prompt}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gemini 呼叫（同步，大型上下文分析 / 診斷專用）
+# ──────────────────────────────────────────────────────────────────────────────
+
+def call_gemini(
+    prompt: str,
+    system: str | None = None,
+    timeout: int = 120,
+    trace_id: str | None = None,
+) -> tuple[str, dict | None]:
+    """呼叫 Gemini 2.5 Pro（直連 Google API），回傳 (text, usage_dict)。"""
+    if not GEMINI_API_KEY:
+        return "（Gemini 不可用，未設定 GEMINI_API_KEY）", None
+
+    contents = []
+    if system:
+        contents.append({"role": "user", "parts": [{"text": system}]})
+        contents.append({"role": "model", "parts": [{"text": "已理解，我會按照指示回覆。"}]})
+    contents.append({"role": "user", "parts": [{"text": prompt}]})
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 8192},
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        meta = data.get("usageMetadata", {})
+        usage = {
+            "input_tokens": meta.get("promptTokenCount", 0),
+            "output_tokens": meta.get("candidatesTokenCount", 0),
+            "model": GEMINI_MODEL,
+        }
+        print(f"[ORCH] Gemini done trace={trace_id} in={usage['input_tokens']} out={usage['output_tokens']}", flush=True)
+        return text, usage
+    except Exception as exc:
+        print(f"[ORCH] Gemini call failed trace={trace_id} err={exc}", flush=True)
+        return f"（Gemini 呼叫失敗：{exc}）", None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
