@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from job_manager import ensure_dirs, create_job, pick_job, complete_job, fail_job, get_job, list_pending, sweep_timeouts
+from job_manager import ensure_dirs, create_job, pick_job, complete_job, fail_job, get_job, list_pending, list_recent, cost_summary, sweep_timeouts
 from orchestrator import route, call_fable, dispatch_to_opus, circuit_record_success, circuit_record_failure
 
 _BUILD_SHA = os.getenv("BUILD_SHA", "dev")
@@ -207,6 +207,35 @@ async def job_status(job_id: str) -> dict:
 async def list_pending_jobs() -> dict:
     jobs = list_pending()
     return {"count": len(jobs), "jobs": [{"job_id": j["job_id"], "task_type": j["task_type"], "target": j["target"]} for j in jobs]}
+
+
+@app.get("/jobs/history")
+async def jobs_history(status: str = "done", limit: int = 20) -> dict:
+    if status not in ("done", "dead", "running", "pending"):
+        raise HTTPException(status_code=400, detail="status must be done|dead|running|pending")
+    jobs = list_recent(status, min(limit, 100))
+    return {
+        "status": status,
+        "count": len(jobs),
+        "jobs": [
+            {
+                "job_id": j["job_id"],
+                "target": j.get("target"),
+                "task_type": j.get("task_type"),
+                "chat_id": j.get("chat_id"),
+                "created_at": j.get("created_at"),
+                "completed_at": j.get("completed_at"),
+                "attempt": j.get("attempt"),
+                "result_preview": (j.get("result") or "")[:80],
+            }
+            for j in jobs
+        ],
+    }
+
+
+@app.get("/costs")
+async def cost_stats() -> dict:
+    return cost_summary()
 
 
 @app.get("/circuit")
