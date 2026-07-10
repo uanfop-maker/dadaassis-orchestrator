@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from job_manager import ensure_dirs, create_job, pick_job, complete_job, fail_job, get_job, list_pending, list_recent, cost_summary, sweep_timeouts
-from orchestrator import route, call_fable, dispatch_to_opus, circuit_record_success, circuit_record_failure
+from orchestrator import route, call_fable, call_gemini, dispatch_to_opus, circuit_record_success, circuit_record_failure
 
 _BUILD_SHA = os.getenv("BUILD_SHA", "dev")
 
@@ -111,6 +111,17 @@ async def dispatch(req: DispatchRequest, x_trace_id: str | None = Header(default
             result, usage = call_fable(req.prompt, trace_id=trace_id)
             complete_job(j["job_id"], result, usage)
             return {"status": "done", "job_id": j["job_id"], "target": "fable", "result": result}
+
+    elif target == "gemini":
+        # Gemini：同步呼叫，大型上下文分析
+        j = pick_job(job["job_id"])
+        if j:
+            result, usage = call_gemini(req.prompt, trace_id=trace_id)
+            complete_job(j["job_id"], result, usage)
+            # Push to Telegram if token set
+            if TELEGRAM_BOT_TOKEN:
+                asyncio.create_task(_push_result_to_telegram(j, result))
+            return {"status": "done", "job_id": j["job_id"], "target": "gemini", "result": result}
 
     elif target == "opus":
         # cc-opus：非同步 HTTP push
