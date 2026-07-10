@@ -175,6 +175,43 @@ def list_pending() -> list[dict[str, Any]]:
     return sorted(jobs, key=lambda j: j.get("created_at", 0))
 
 
+def list_recent(status: str = "done", limit: int = 20) -> list[dict[str, Any]]:
+    d = DIRS.get(status, DIRS["done"])
+    jobs = []
+    for f in d.glob("*.json"):
+        try:
+            jobs.append(json.loads(f.read_text()))
+        except Exception:
+            pass
+    return sorted(jobs, key=lambda j: j.get("completed_at", j.get("created_at", 0)), reverse=True)[:limit]
+
+
+def cost_summary() -> dict:
+    ledger = STATE_DIR / "cost_ledger.jsonl"
+    if not ledger.exists():
+        return {"total_jobs": 0, "total_input_tokens": 0, "total_output_tokens": 0, "total_cost_usd": 0.0, "by_target": {}}
+    total_in = total_out = total_cost = 0
+    by_target: dict[str, dict] = {}
+    count = 0
+    with ledger.open() as fp:
+        for line in fp:
+            try:
+                e = json.loads(line)
+                count += 1
+                total_in += e.get("input_tokens", 0)
+                total_out += e.get("output_tokens", 0)
+                total_cost += e.get("cost_usd", 0) or 0
+                t = e.get("target", "unknown")
+                bt = by_target.setdefault(t, {"jobs": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0})
+                bt["jobs"] += 1
+                bt["input_tokens"] += e.get("input_tokens", 0)
+                bt["output_tokens"] += e.get("output_tokens", 0)
+                bt["cost_usd"] += e.get("cost_usd", 0) or 0
+            except Exception:
+                pass
+    return {"total_jobs": count, "total_input_tokens": total_in, "total_output_tokens": total_out, "total_cost_usd": round(total_cost, 6), "by_target": by_target}
+
+
 def _append_cost_ledger(job: dict) -> None:
     try:
         ledger = STATE_DIR / "cost_ledger.jsonl"
