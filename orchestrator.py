@@ -107,7 +107,7 @@ def _classify(text: str, explicit_cmd: str | None = None) -> str:
         return "opus"
     if explicit_cmd in ("/write", "/story", "/poem"):
         return "fable"
-    if explicit_cmd in ("/diagnose", "/gemini"):
+    if explicit_cmd in ("/diagnose", "/gemini", "/search"):
         return "gemini"
     lower = text.lower()
     for kw in GEMINI_KEYWORDS:
@@ -208,7 +208,7 @@ def call_gemini(
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         try:
-            resp = requests.post(url, json={"contents": contents, "generationConfig": {"maxOutputTokens": 8192}}, timeout=timeout)
+            resp = requests.post(url, json={"contents": contents, "generationConfig": {"maxOutputTokens": 8192}, "tools": [{"google_search": {}}]}, timeout=timeout)
             if resp.status_code not in (429, 500, 502, 503):
                 resp.raise_for_status()
                 data = resp.json()
