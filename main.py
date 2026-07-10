@@ -105,11 +105,13 @@ async def dispatch(req: DispatchRequest, x_trace_id: str | None = Header(default
         return {"status": "duplicate", "message": "相同任務處理中"}
 
     if target == "fable":
-        # Fable：同步呼叫，立即回傳結果
+        # Fable：同步呼叫，立即回傳結果並 push 到 Telegram
         j = pick_job(job["job_id"])
         if j:
             result, usage = call_fable(req.prompt, trace_id=trace_id)
             complete_job(j["job_id"], result, usage)
+            if TELEGRAM_BOT_TOKEN:
+                asyncio.create_task(_push_result_to_telegram(j, result))
             return {"status": "done", "job_id": j["job_id"], "target": "fable", "result": result}
 
     elif target == "gemini":
