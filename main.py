@@ -11,7 +11,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from job_manager import ensure_dirs, create_job, pick_job, complete_job, fail_job, get_job, list_pending, list_recent, cost_summary, sweep_timeouts
-from orchestrator import route, call_fable, call_gemini, dispatch_to_opus, circuit_record_success, circuit_record_failure
+from orchestrator import (
+    route, call_fable, call_gemini, dispatch_to_opus, dispatch_to_persona,
+    circuit_record_success, circuit_record_failure, PERSONA_TARGETS,
+)
 
 _BUILD_SHA = os.getenv("BUILD_SHA", "dev")
 
@@ -89,6 +92,7 @@ async def dispatch(req: DispatchRequest, x_trace_id: str | None = Header(default
     task_type = req.task_type or (
         "deep_reasoning" if target == "opus"
         else "creative" if target == "fable"
+        else "persona" if target in PERSONA_TARGETS
         else "local"
     )
 
@@ -136,6 +140,16 @@ async def dispatch(req: DispatchRequest, x_trace_id: str | None = Header(default
                 return {"status": "fallback_local", "job_id": j["job_id"], "message": "cc-opus 不可用，請改用本地模式"}
         return {"status": "dispatched", "job_id": job["job_id"], "target": "opus"}
 
+    elif target in PERSONA_TARGETS:
+        # Harper/Benjamin/Lucas 單一角色 solo 派工：非同步 HTTP push，跟 opus 同一套模式
+        j = pick_job(job["job_id"])
+        if j:
+            ok = dispatch_to_persona(target, j)
+            if not ok:
+                fail_job(j["job_id"], f"{target} circuit breaker open or dispatch failed, fallback to local")
+                return {"status": "fallback_local", "job_id": j["job_id"], "message": f"{target} 目前不可用，請改用本地模式"}
+        return {"status": "dispatched", "job_id": job["job_id"], "target": target}
+
     # local：由呼叫方自行處理
     return {"status": "local", "job_id": job["job_id"], "target": "local"}
 
@@ -164,20 +178,33 @@ async def job_callback(
 
     print(f"[CALLBACK] job={req.job_id} status={req.status} trace={x_trace_id}", flush=True)
 
+    # 熔斷器要記哪個 key：opus 沿用預設 key；persona job 記自己的 key（+ 共享的 OAuth key）
+    job_before = get_job(req.job_id)
+    job_target = (job_before or {}).get("target", "opus")
+    circuit_key = job_target if job_target in PERSONA_TARGETS else "opus"
+
     if req.status == "done":
         ok = complete_job(req.job_id, req.result or "", req.usage)
         if not ok:
             print(f"[CALLBACK] job={req.job_id} not in running, discarded (idempotent)", flush=True)
             return {"accepted": True, "idempotent_discard": True}
-        circuit_record_success()
+        circuit_record_success(circuit_key)
+        if circuit_key in PERSONA_TARGETS:
+            circuit_record_success("persona_oauth")
         # 嘗試把結果推送到 Telegram
         job = get_job(req.job_id)
         if job and TELEGRAM_BOT_TOKEN:
             asyncio.create_task(_push_result_to_telegram(job, req.result or ""))
         return {"accepted": True, "idempotent_discard": False}
     else:
-        job = fail_job(req.job_id, req.error or "unknown error")
-        circuit_record_failure()
+        # persona worker 目前把失敗原因放在 result（不是 error），兩邊都吃避免漏記
+        error_detail = req.error or req.result or "unknown error"
+        job = fail_job(req.job_id, error_detail)
+        circuit_record_failure(circuit_key)
+        if circuit_key in PERSONA_TARGETS and "OAUTH_LIMIT" in error_detail:
+            # 三個 persona 共用同一組 Max 訂閱 credential，一個撞牆代表全部要停
+            circuit_record_failure("persona_oauth")
+            print(f"[CALLBACK] persona_oauth circuit tripped by {job_target} job={req.job_id}", flush=True)
         return {"accepted": True, "new_status": (job or {}).get("status")}
 
 
@@ -254,7 +281,8 @@ async def cost_stats() -> dict:
 @app.get("/circuit")
 async def circuit_status() -> dict:
     from orchestrator import _load_circuit
-    return _load_circuit()
+    keys = ["opus", "persona_oauth", *PERSONA_TARGETS]
+    return {key: _load_circuit(key) for key in keys}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
