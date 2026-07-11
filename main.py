@@ -396,9 +396,7 @@ async def _grok_synthesis(prompt: str, results: dict, use_opus: bool) -> str:
 請用繁體中文輸出，格式清晰，直接呈現最終答案。"""
 
     if use_opus:
-        from orchestrator import dispatch_to_opus as _opus
-        result, _ = call_gemini(synthesis_prompt)
-        return result
+        return await _opus_synthesis(synthesis_prompt, parts)
 
     # 預設：OpenRouter Sonnet 同步呼叫
     from orchestrator import OPENROUTER_API_KEY, OPENROUTER_URL, SONNET_MODEL
@@ -417,6 +415,39 @@ async def _grok_synthesis(prompt: str, results: dict, use_opus: bool) -> str:
         return resp.json()["choices"][0]["message"]["content"]
     except Exception as exc:
         return f"（Grok 整合失敗：{exc}）\n\n{'---'.join(parts)}"
+
+
+async def _opus_synthesis(synthesis_prompt: str, parts: list[str]) -> str:
+    """use_opus_synthesis=True 時真的呼叫 cc-opus（先前這裡誤呼叫了 Gemini，import 了 dispatch_to_opus 沒用）。
+
+    cc-opus 是非同步 job/callback 模式，這裡借用既有的 job_manager + 通用 /callback
+    端點，用輪詢等結果，讓呼叫端看起來像同步呼叫。
+    """
+    job = create_job(chat_id=0, prompt=synthesis_prompt, task_type="team_synthesis", target="opus")
+    j = pick_job(job["job_id"]) if job else None
+    if not j:
+        print("[TEAM] opus synthesis: job creation/pick failed, falling back", flush=True)
+        return f"（Opus 整合：任務建立失敗，改用預設整合）\n\n{chr(10).join(parts)}"
+
+    if not dispatch_to_opus(j):
+        fail_job(j["job_id"], "opus dispatch failed or circuit open")
+        print(f"[TEAM] opus synthesis: dispatch failed job={j['job_id']}", flush=True)
+        return f"（Opus 整合：cc-opus 目前不可用，改用預設整合）\n\n{chr(10).join(parts)}"
+
+    # 輪詢等 callback，opus 深度推理較久，給到 170 秒（pick_job 的 deadline 是 300 秒）
+    cur = None
+    for _ in range(85):
+        await asyncio.sleep(2)
+        cur = get_job(j["job_id"])
+        if cur and cur["status"] in ("done", "dead"):
+            break
+
+    if cur and cur.get("status") == "done" and cur.get("result"):
+        print(f"[TEAM] opus synthesis done job={j['job_id']}", flush=True)
+        return cur["result"]
+
+    print(f"[TEAM] opus synthesis timeout/failed job={j['job_id']} status={(cur or {}).get('status')}", flush=True)
+    return f"（Opus 整合逾時或失敗，改用預設整合）\n\n{chr(10).join(parts)}"
 
 
 class TeamCallbackRequest(BaseModel):
