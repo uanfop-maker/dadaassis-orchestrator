@@ -417,37 +417,57 @@ async def _grok_synthesis(prompt: str, results: dict, use_opus: bool) -> str:
         return f"（Grok 整合失敗：{exc}）\n\n{'---'.join(parts)}"
 
 
+OPUS_SYNTHESIS_MAX_ATTEMPTS = 3
+OPUS_SYNTHESIS_POLL_TIMEOUT_SEC = 90  # per attempt
+
+
 async def _opus_synthesis(synthesis_prompt: str, parts: list[str]) -> str:
     """use_opus_synthesis=True 時真的呼叫 cc-opus（先前這裡誤呼叫了 Gemini，import 了 dispatch_to_opus 沒用）。
+
+    ganamia 定的規則：opus 是 synthesis 的主力，重試最多 3 次；3 次都失敗才讓 Fable
+    出現當最終備援——Fable 平常不參與（太貴），不是每次 synthesis 都跑一輪。3 次都
+    失敗以外的情況，Fable 只在 ganamia 明確指定時才出現（既有的 /write /story /poem
+    顯式指令路由，跟這裡無關，不受影響）。
 
     cc-opus 是非同步 job/callback 模式，這裡借用既有的 job_manager + 通用 /callback
     端點，用輪詢等結果，讓呼叫端看起來像同步呼叫。
     """
+    for attempt in range(1, OPUS_SYNTHESIS_MAX_ATTEMPTS + 1):
+        result = await _try_opus_synthesis_once(synthesis_prompt, attempt)
+        if result is not None:
+            return result
+
+    print(f"[TEAM] opus synthesis failed {OPUS_SYNTHESIS_MAX_ATTEMPTS}x, escalating to Fable", flush=True)
+    fable_text, _usage = call_fable(synthesis_prompt, trace_id=f"team-synthesis-fable-fallback")
+    return fable_text
+
+
+async def _try_opus_synthesis_once(synthesis_prompt: str, attempt: int) -> str | None:
+    """一次 opus synthesis 嘗試。成功回傳結果文字，失敗/逾時回傳 None（讓外層決定要不要重試）。"""
     job = create_job(chat_id=0, prompt=synthesis_prompt, task_type="team_synthesis", target="opus")
     j = pick_job(job["job_id"]) if job else None
     if not j:
-        print("[TEAM] opus synthesis: job creation/pick failed, falling back", flush=True)
-        return f"（Opus 整合：任務建立失敗，改用預設整合）\n\n{chr(10).join(parts)}"
+        print(f"[TEAM] opus synthesis attempt={attempt}: job creation/pick failed", flush=True)
+        return None
 
     if not dispatch_to_opus(j):
         fail_job(j["job_id"], "opus dispatch failed or circuit open")
-        print(f"[TEAM] opus synthesis: dispatch failed job={j['job_id']}", flush=True)
-        return f"（Opus 整合：cc-opus 目前不可用，改用預設整合）\n\n{chr(10).join(parts)}"
+        print(f"[TEAM] opus synthesis attempt={attempt}: dispatch failed job={j['job_id']}", flush=True)
+        return None
 
-    # 輪詢等 callback，opus 深度推理較久，給到 170 秒（pick_job 的 deadline 是 300 秒）
     cur = None
-    for _ in range(85):
+    for _ in range(OPUS_SYNTHESIS_POLL_TIMEOUT_SEC // 2):
         await asyncio.sleep(2)
         cur = get_job(j["job_id"])
         if cur and cur["status"] in ("done", "dead"):
             break
 
     if cur and cur.get("status") == "done" and cur.get("result"):
-        print(f"[TEAM] opus synthesis done job={j['job_id']}", flush=True)
+        print(f"[TEAM] opus synthesis attempt={attempt}: done job={j['job_id']}", flush=True)
         return cur["result"]
 
-    print(f"[TEAM] opus synthesis timeout/failed job={j['job_id']} status={(cur or {}).get('status')}", flush=True)
-    return f"（Opus 整合逾時或失敗，改用預設整合）\n\n{chr(10).join(parts)}"
+    print(f"[TEAM] opus synthesis attempt={attempt}: timeout/failed job={j['job_id']} status={(cur or {}).get('status')}", flush=True)
+    return None
 
 
 class TeamCallbackRequest(BaseModel):
