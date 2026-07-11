@@ -255,3 +255,173 @@ async def cost_stats() -> dict:
 async def circuit_status() -> dict:
     from orchestrator import _load_circuit
     return _load_circuit()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Team Dispatch（Harper + Benjamin + Lucas → Grok 整合）
+# ──────────────────────────────────────────────────────────────────────────────
+
+HARPER_ENDPOINT = os.getenv("CC_HARPER_ENDPOINT", "http://cc-harper:8080")
+BENJAMIN_ENDPOINT = os.getenv("CC_BENJAMIN_ENDPOINT", "http://cc-benjamin:8080")
+LUCAS_ENDPOINT = os.getenv("CC_LUCAS_ENDPOINT", "http://cc-lucas:8080")
+INTER_SERVICE_SECRET_OUT = os.getenv("INTER_SERVICE_SECRET_A", "")
+
+_team_results: dict[str, dict] = {}  # team_id → {role: result, ...}
+_team_locks: dict[str, asyncio.Lock] = {}
+
+
+class TeamDispatchRequest(BaseModel):
+    chat_id: int
+    message_thread_id: int | None = None
+    prompt: str
+    use_opus_synthesis: bool = False  # True → Opus 4.8 整合，預設 Sonnet
+
+
+@app.post("/team-dispatch")
+async def team_dispatch(req: TeamDispatchRequest) -> dict:
+    """Fan-out 到 Harper + Benjamin + Lucas，等全部回傳後 Grok 整合，結果 push 到 TG。"""
+    team_id = "team_" + str(uuid.uuid4())[:8]
+    _team_results[team_id] = {}
+    _team_locks[team_id] = asyncio.Lock()
+
+    self_host = os.getenv("SELF_HOST", "cc-orchestrator")
+    self_port = os.getenv("SELF_PORT", "8080")
+    callback_url = f"http://{self_host}:{self_port}/team-callback"
+
+    asyncio.create_task(_run_team(req, team_id, callback_url))
+    return {"status": "dispatched", "team_id": team_id}
+
+
+async def _run_team(req: TeamDispatchRequest, team_id: str, callback_url: str) -> None:
+    import httpx as _httpx
+
+    agents = [
+        ("harper", HARPER_ENDPOINT),
+        ("benjamin", BENJAMIN_ENDPOINT),
+        ("lucas", LUCAS_ENDPOINT),
+    ]
+
+    async def _dispatch_agent(role: str, endpoint: str) -> None:
+        job_id = f"{team_id}_{role}"
+        payload = {
+            "job_id": job_id,
+            "team_id": team_id,
+            "prompt": req.prompt,
+            "callback_url": callback_url,
+        }
+        headers = {"Content-Type": "application/json", "X-DaDaAssis-Auth": INTER_SERVICE_SECRET_OUT}
+        async with _httpx.AsyncClient(timeout=20) as client:
+            try:
+                r = await client.post(f"{endpoint}/job", json=payload, headers=headers)
+                if r.status_code not in (200, 202):
+                    print(f"[TEAM] {role} dispatch failed status={r.status_code}", flush=True)
+            except Exception as exc:
+                print(f"[TEAM] {role} dispatch err={exc}", flush=True)
+                async with _team_locks[team_id]:
+                    _team_results[team_id][role] = f"（{role} 不可用：{exc}）"
+
+    await asyncio.gather(*[_dispatch_agent(role, ep) for role, ep in agents])
+
+    # 等待所有 agent 回傳（最多 120 秒）
+    for _ in range(60):
+        await asyncio.sleep(2)
+        async with _team_locks[team_id]:
+            done = len(_team_results[team_id])
+        if done >= 3:
+            break
+
+    async with _team_locks[team_id]:
+        results = dict(_team_results[team_id])
+
+    if not results:
+        await _push_team_result(req.chat_id, req.message_thread_id, "（所有 agent 無回應）")
+        return
+
+    # Grok 整合
+    synthesis = await _grok_synthesis(req.prompt, results, req.use_opus_synthesis)
+    await _push_team_result(req.chat_id, req.message_thread_id, synthesis)
+
+    # 清理
+    _team_results.pop(team_id, None)
+    _team_locks.pop(team_id, None)
+
+
+async def _grok_synthesis(prompt: str, results: dict, use_opus: bool) -> str:
+    parts = []
+    for role in ("harper", "benjamin", "lucas"):
+        val = results.get(role, "（未回應）")
+        parts.append(f"**{role.capitalize()}**：\n{val}")
+
+    synthesis_prompt = f"""你是 Grok，DaDaAssis 4人AI核心團隊的總協調官。
+
+使用者的問題：
+{prompt}
+
+團隊分析：
+{chr(10).join(parts)}
+
+你的任務：
+1. 整合三位專家的觀點
+2. 解決內部衝突，取得最佳答案
+3. 輸出一份流暢、有條理的最終回答
+
+請用繁體中文輸出，格式清晰，直接呈現最終答案。"""
+
+    if use_opus:
+        from orchestrator import dispatch_to_opus as _opus
+        result, _ = call_gemini(synthesis_prompt)
+        return result
+
+    # 預設：OpenRouter Sonnet 同步呼叫
+    from orchestrator import OPENROUTER_API_KEY, OPENROUTER_URL, SONNET_MODEL
+    import requests
+    if not OPENROUTER_API_KEY:
+        return f"（Grok 整合：API key 未設定）\n\n{'---'.join(parts)}"
+    try:
+        resp = requests.post(
+            OPENROUTER_URL,
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
+                     "HTTP-Referer": "https://dadaassis.zeabur.app", "X-Title": "DaDaAssis Grok"},
+            json={"model": SONNET_MODEL, "messages": [{"role": "user", "content": synthesis_prompt}], "max_tokens": 3000},
+            timeout=90,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as exc:
+        return f"（Grok 整合失敗：{exc}）\n\n{'---'.join(parts)}"
+
+
+class TeamCallbackRequest(BaseModel):
+    job_id: str
+    team_id: str
+    role: str
+    status: str
+    result: str
+
+
+@app.post("/team-callback")
+async def team_callback(
+    req: TeamCallbackRequest,
+    x_auth: str | None = Header(default=None, alias="X-DaDaAssis-Auth"),
+) -> dict:
+    if INTER_SERVICE_SECRET_IN and x_auth != INTER_SERVICE_SECRET_IN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    print(f"[TEAM-CB] team={req.team_id} role={req.role} status={req.status}", flush=True)
+    if req.team_id in _team_locks:
+        async with _team_locks[req.team_id]:
+            _team_results[req.team_id][req.role] = req.result if req.status == "done" else f"（{req.role} 失敗：{req.result}）"
+    return {"accepted": True}
+
+
+async def _push_team_result(chat_id: int, thread_id: int | None, result: str) -> None:
+    import httpx as _httpx
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    params = {"chat_id": chat_id, "text": result, "parse_mode": "Markdown"}
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    async with _httpx.AsyncClient(timeout=30) as client:
+        try:
+            await client.post(f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=params)
+        except Exception as exc:
+            print(f"[TEAM] push_tg err={exc}", flush=True)
