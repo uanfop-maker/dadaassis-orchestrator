@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from job_manager import ensure_dirs, create_job, pick_job, complete_job, fail_job, get_job, list_pending, list_recent, cost_summary, sweep_timeouts
 from orchestrator import (
-    route, call_fable, call_gemini, dispatch_to_opus, dispatch_to_persona,
+    route, call_fable, call_gemini, dispatch_to_opus, dispatch_to_fable, dispatch_to_persona,
     circuit_record_success, circuit_record_failure, PERSONA_TARGETS,
 )
 
@@ -109,14 +109,15 @@ async def dispatch(req: DispatchRequest, x_trace_id: str | None = Header(default
         return {"status": "duplicate", "message": "相同任務處理中"}
 
     if target == "fable":
-        # Fable：同步呼叫，立即回傳結果並 push 到 Telegram
+        # cc-fable：非同步 HTTP push，跟 opus 同一套模式（獨立服務，用完即 clear）
         j = pick_job(job["job_id"])
         if j:
-            result, usage = call_fable(req.prompt, trace_id=trace_id)
-            complete_job(j["job_id"], result, usage)
-            if TELEGRAM_BOT_TOKEN:
-                asyncio.create_task(_push_result_to_telegram(j, result))
-            return {"status": "done", "job_id": j["job_id"], "target": "fable", "result": result}
+            ok = dispatch_to_fable(j)
+            if not ok:
+                # 熔斷降級：改為 local
+                fail_job(j["job_id"], "circuit breaker open, fallback to local")
+                return {"status": "fallback_local", "job_id": j["job_id"], "message": "cc-fable 不可用，請改用本地模式"}
+        return {"status": "dispatched", "job_id": job["job_id"], "target": "fable"}
 
     elif target == "gemini":
         # Gemini：同步呼叫，大型上下文分析
@@ -178,10 +179,10 @@ async def job_callback(
 
     print(f"[CALLBACK] job={req.job_id} status={req.status} trace={x_trace_id}", flush=True)
 
-    # 熔斷器要記哪個 key：opus 沿用預設 key；persona job 記自己的 key（+ 共享的 OAuth key）
+    # 熔斷器要記哪個 key：opus/fable 各自獨立 key；persona job 記自己的 key（+ 共享的 OAuth key）
     job_before = get_job(req.job_id)
     job_target = (job_before or {}).get("target", "opus")
-    circuit_key = job_target if job_target in PERSONA_TARGETS else "opus"
+    circuit_key = job_target if job_target in PERSONA_TARGETS or job_target == "fable" else "opus"
 
     if req.status == "done":
         ok = complete_job(req.job_id, req.result or "", req.usage)
@@ -437,8 +438,23 @@ async def _opus_synthesis(synthesis_prompt: str, parts: list[str]) -> str:
         if result is not None:
             return result
 
-    print(f"[TEAM] opus synthesis failed {OPUS_SYNTHESIS_MAX_ATTEMPTS}x, escalating to Fable", flush=True)
-    fable_text, _usage = call_fable(synthesis_prompt, trace_id=f"team-synthesis-fable-fallback")
+    print(f"[TEAM] opus synthesis failed {OPUS_SYNTHESIS_MAX_ATTEMPTS}x, escalating to cc-fable", flush=True)
+    fable_job = create_job(chat_id=0, prompt=synthesis_prompt, task_type="team_synthesis_fallback", target="fable")
+    fj = pick_job(fable_job["job_id"]) if fable_job else None
+    if fj and dispatch_to_fable(fj):
+        cur = None
+        for _ in range(OPUS_SYNTHESIS_POLL_TIMEOUT_SEC // 2):
+            await asyncio.sleep(2)
+            cur = get_job(fj["job_id"])
+            if cur and cur["status"] in ("done", "dead"):
+                break
+        if cur and cur.get("status") == "done" and cur.get("result"):
+            return cur["result"]
+        fail_job(fj["job_id"], "fable dispatch timeout")
+
+    # cc-fable 也不可用時的最終備援：直接同步呼叫 OpenRouter
+    print("[TEAM] cc-fable dispatch/timeout failed, final fallback to inline call_fable", flush=True)
+    fable_text, _usage = call_fable(synthesis_prompt, trace_id="team-synthesis-fable-fallback")
     return fable_text
 
 

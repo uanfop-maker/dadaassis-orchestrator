@@ -18,6 +18,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 FABLE_MODEL = os.getenv("FABLE_MODEL", "anthropic/claude-fable-5")
 SONNET_MODEL = os.getenv("SONNET_MODEL", "anthropic/claude-sonnet-4-6")
 OPUS_ENDPOINT = os.getenv("CC_OPUS_ENDPOINT", "http://cc-opus:8080")
+FABLE_ENDPOINT = os.getenv("CC_FABLE_ENDPOINT", "http://cc-fable:8080")
 INTER_SERVICE_SECRET_OUT = os.getenv("INTER_SERVICE_SECRET_A", "")  # cc-v2 → cc-opus / persona workers
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
@@ -185,6 +186,8 @@ def route(
         return target
     if target == "opus" and not circuit_allow("opus"):
         return "gemini" if GEMINI_API_KEY else "local"
+    if target == "fable" and not circuit_allow("fable"):
+        return "local"
     if target == "gemini" and not GEMINI_API_KEY:
         return "opus" if circuit_allow("opus") else "local"
     return target
@@ -344,6 +347,55 @@ def dispatch_to_opus(
     except Exception as exc:
         print(f"[ORCH] dispatch_to_opus failed job={job.get('job_id')} err={exc}", flush=True)
         circuit_record_failure()
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cc-fable 非同步分派（HTTP push）——跟 dispatch_to_opus 同一套模式，獨立熔斷器 key="fable"
+# ──────────────────────────────────────────────────────────────────────────────
+
+def dispatch_to_fable(
+    job: dict[str, Any],
+    callback_url: str | None = None,
+) -> bool:
+    """
+    向 cc-fable POST job，成功回 True，失敗更新 fable 熔斷器並回 False。
+    每個 job 都是單次、無歷史的呼叫，cc-fable 本身不保留 context。
+    """
+    if not callback_url:
+        self_host = os.getenv("SELF_HOST", "cc-orchestrator")
+        self_port = os.getenv("SELF_PORT", "8080")
+        callback_url = f"http://{self_host}:{self_port}/callback"
+
+    payload = {
+        "job_id": job["job_id"],
+        "task_type": job.get("task_type", "creative"),
+        "prompt": job.get("prompt", ""),
+        "context": job.get("extra", {}),
+        "callback_url": callback_url,
+        "deadline_ts": job.get("deadline_ts", int(time.time()) + 300),
+        "attempt": job.get("attempt", 1),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-DaDaAssis-Auth": INTER_SERVICE_SECRET_OUT,
+        "X-Trace-Id": job.get("trace_id", str(uuid.uuid4())),
+    }
+    try:
+        resp = requests.post(
+            f"{FABLE_ENDPOINT}/job",
+            headers=headers,
+            json=payload,
+            timeout=30,  # 含冷啟動時間
+        )
+        if resp.status_code in (200, 202):
+            circuit_record_success("fable")
+            return True
+        circuit_record_failure("fable")
+        return False
+    except Exception as exc:
+        print(f"[ORCH] dispatch_to_fable failed job={job.get('job_id')} err={exc}", flush=True)
+        circuit_record_failure("fable")
         return False
 
 
