@@ -209,20 +209,62 @@ async def job_callback(
         return {"accepted": True, "new_status": (job or {}).get("status")}
 
 
-async def _push_result_to_telegram(job: dict, result: str) -> None:
+TELEGRAM_MAX_CHARS = 4000  # Telegram 硬限制 4096，留緩衝給 chunk 標記
+
+
+def _chunk_text(text: str, max_chars: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """依段落邊界切割長文字，避免超過 Telegram sendMessage 長度上限（4096）。"""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        split_at = remaining.rfind("\n\n", 0, max_chars)
+        if split_at <= 0:
+            split_at = remaining.rfind("\n", 0, max_chars)
+        if split_at <= 0:
+            split_at = max_chars
+        chunks.append(remaining[:split_at].rstrip("\n"))
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+async def _send_telegram_message(chat_id, thread_id, text: str, label: str = "") -> None:
+    """發送一則訊息，處理長度切割 + Markdown 解析失敗 fallback，並確實記錄失敗（不吞錯）。"""
     import httpx
+
+    chunks = _chunk_text(text)
+    async with httpx.AsyncClient(timeout=30) as client:
+        for i, chunk in enumerate(chunks):
+            prefix = f"[{i + 1}/{len(chunks)}]\n" if len(chunks) > 1 else ""
+            params = {"chat_id": chat_id, "text": prefix + chunk, "parse_mode": "Markdown"}
+            if thread_id:
+                params["message_thread_id"] = thread_id
+            try:
+                resp = await client.post(f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=params)
+                if resp.status_code != 200:
+                    # legacy Markdown 對 LLM 產出的文字很容易解析失敗（未配對的 * _ 等），降級成純文字重試
+                    params.pop("parse_mode", None)
+                    resp2 = await client.post(f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=params)
+                    if resp2.status_code != 200:
+                        print(
+                            f"[PUSH_TG] FAILED {label} chunk={i + 1}/{len(chunks)} "
+                            f"status={resp.status_code} body={resp.text[:300]} "
+                            f"plain_status={resp2.status_code} plain_body={resp2.text[:300]}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(f"[PUSH_TG] EXCEPTION {label} chunk={i + 1}/{len(chunks)} err={exc}", flush=True)
+
+
+async def _push_result_to_telegram(job: dict, result: str) -> None:
     chat_id = job.get("chat_id")
     thread_id = job.get("message_thread_id")
     if not chat_id:
         return
-    params = {"chat_id": chat_id, "text": result, "parse_mode": "Markdown"}
-    if thread_id:
-        params["message_thread_id"] = thread_id
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            await client.post(f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=params)
-    except Exception as exc:
-        print(f"[PUSH_TG] error job={job.get('job_id')} err={exc}", flush=True)
+    await _send_telegram_message(chat_id, thread_id, result, label=f"job={job.get('job_id')}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -509,14 +551,6 @@ async def team_callback(
 
 
 async def _push_team_result(chat_id: int, thread_id: int | None, result: str) -> None:
-    import httpx as _httpx
     if not TELEGRAM_BOT_TOKEN:
         return
-    params = {"chat_id": chat_id, "text": result, "parse_mode": "Markdown"}
-    if thread_id:
-        params["message_thread_id"] = thread_id
-    async with _httpx.AsyncClient(timeout=30) as client:
-        try:
-            await client.post(f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=params)
-        except Exception as exc:
-            print(f"[TEAM] push_tg err={exc}", flush=True)
+    await _send_telegram_message(chat_id, thread_id, result, label="team")
